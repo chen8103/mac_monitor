@@ -17,18 +17,18 @@
 ## 系统要求
 
 - macOS 14.0 或更高版本。
-- 已在 Apple Silicon（arm64）上验证。
+- 从下一个正式版本开始，发布包为 Universal 2，支持 Apple Silicon（arm64）和 Intel（x86_64）；`v1.0.1` 及更早版本不受此保证。
 - 源码构建需要 Swift 6.0 或更高版本及 Command Line Tools。
 
 ## 安装
 
 ### 下载已构建版本
 
-1. 下载 [MacMonitor-1.0.0.zip](https://github.com/chen8103/mac_monitor/releases/download/v1.0.0/MacMonitor-1.0.0.zip)。
+1. 在 [Releases](https://github.com/chen8103/mac_monitor/releases) 下载最新的 `MacMonitor-X.Y.Z.zip`。
 2. 解压后得到 `MacMonitor.app`。
 3. 双击启动，在屏幕顶部菜单栏找到应用图标。
 
-当前应用未进行 Apple Developer ID 签名或公证，请仅运行自己信任的来源；也可以直接从源码构建。
+从下一个正式版本开始，发布包将使用 Apple Developer ID 签名、Apple 公证并附带公证票据；请只下载同时带有 ZIP 校验和文件、且发行说明明确标记已签名和公证的版本。`v1.0.1` 及更早版本没有有效的分发签名，不应作为外部安装包使用。
 
 ### 从源码构建
 
@@ -39,7 +39,27 @@ cd mac_monitor
 open dist/MacMonitor.app
 ```
 
-构建产物位于 `dist/MacMonitor.app`。
+构建产物位于 `dist/MacMonitor.app`。这是仅供本机开发验证的 ad-hoc 签名包；不得将它直接分享给其他用户。
+
+### 正式发布
+
+`Scripts/release.sh vX.Y.Z` 只为已有、干净工作树上的版本 tag 生成正式发布物。它会运行代码检查、构建 Universal 2 app、使用 Developer ID 签名、提交 Apple 公证、staple 公证票据，并在上传前验证签名、Gatekeeper、两种架构和 ZIP 完整性。
+
+本机发布需要安全配置以下环境变量，任何凭据都不能提交到仓库：
+
+- `DEVELOPER_ID_APPLICATION`：钥匙串中 Developer ID Application 身份的完整名称。
+- `NOTARY_PROFILE`：已通过 `xcrun notarytool store-credentials` 存入钥匙串的公证 profile；或 `NOTARY_API_KEY_PATH`、`NOTARY_KEY_ID`、`NOTARY_ISSUER_ID` 三个 App Store Connect API key 参数。
+
+GitHub Actions 由版本 tag 触发。配置以下仓库 Secrets 后，工作流才会创建或更新 Release：
+
+- `DEVELOPER_ID_APPLICATION`
+- `DEVELOPER_ID_APPLICATION_P12_BASE64`
+- `DEVELOPER_ID_APPLICATION_P12_PASSWORD`
+- `APPSTORE_KEY_ID`
+- `APPSTORE_ISSUER_ID`
+- `APPSTORE_PRIVATE_KEY`
+
+发布 workflow 缺少任一凭据、签名身份不匹配、不是 Universal 2、未通过公证或 Gatekeeper 校验时都会失败，不会上传不可信附件。
 
 ## 使用
 
@@ -99,4 +119,4 @@ Tests/                        XCTest 与零依赖检查
 
 ## 版本与发布
 
-项目使用语义化版本号和 Git 标签管理发布。当前版本为 [`v1.0.1`](https://github.com/chen8103/mac_monitor/releases/tag/v1.0.1)，GitHub Release 附带经过 ZIP 完整性检查的应用包。
+项目使用语义化版本号和 Git 标签管理发布。`v1.0.1` 及更早的 GitHub Release 没有有效的分发签名；下一个正式版本将由签名、公证、staple、Universal 2 和 ZIP 校验全部通过的发布流水线生成。
