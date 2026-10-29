@@ -11,7 +11,7 @@ final class MetricCalculationsTests: XCTestCase {
         let current = [CPUTicks(user: 20, system: 20, idle: 140, nice: 0)]
         let result = CPUCalculator.usage(previous: previous, current: current)
         XCTAssertEqual(result?.total ?? 0, 25, accuracy: 0.001)
-        XCTAssertEqual(result?.cores.first ?? 0, 25, accuracy: 0.001)
+        XCTAssertEqual(result?.cores[0] ?? -1, 25, accuracy: 0.001)
     }
 
     func testInvalidCPUDeltasAreUnavailable() {
@@ -20,6 +20,18 @@ final class MetricCalculationsTests: XCTestCase {
         XCTAssertNil(CPUCalculator.usage(previous: [tick], current: []))
         XCTAssertNil(CPUCalculator.usage(previous: [tick], current: [tick, tick]))
         XCTAssertNil(CPUCalculator.usage(previous: [tick], current: [CPUTicks(user: 9, system: 10, idle: 10, nice: 0)]))
+    }
+
+    func testZeroDeltaCoreIsUnavailableAlongsideValidCore() {
+        let unchanged = CPUTicks(user: 10, system: 10, idle: 10, nice: 0)
+        let result = CPUCalculator.usage(
+            previous: [unchanged, CPUTicks(user: 10, system: 10, idle: 80, nice: 0)],
+            current: [unchanged, CPUTicks(user: 20, system: 20, idle: 140, nice: 0)]
+        )
+        XCTAssertNotNil(result)
+        XCTAssertNil(result?.cores[0])
+        XCTAssertEqual(result?.cores[1], 25)
+        XCTAssertEqual(result?.total, 25)
     }
 
     func testThresholdBoundaries() {

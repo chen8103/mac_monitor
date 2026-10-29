@@ -1,10 +1,17 @@
+import Darwin
 import Foundation
 
 func expect(_ condition: @autoclosure () -> Bool, _ message: String) {
     if !condition() {
         print("FAIL: \(message)")
+        fflush(stdout)
         exit(1)
     }
+}
+
+func pass(_ message: String) {
+    print("PASS: \(message)")
+    fflush(stdout)
 }
 
 func expectEqual<T: Equatable>(_ actual: T, _ expected: T, _ message: String) {
@@ -23,15 +30,15 @@ func checkActivityCalculations() {
     let regressed = TransferCounters(inbound: 1_125, outbound: 1_999)
     expect(ActivityCalculator.rates(previous: previous, current: regressed, elapsed: 1) == nil, "regressed activity counter")
 
-    let emptyBars = ActivityCalculator.barFractions(for: nil)
-    expectEqual(emptyBars.inbound, 0, "empty inbound bar")
-    expectEqual(emptyBars.outbound, 0, "empty outbound bar")
+    expect(ActivityCalculator.barFractions(for: nil) == nil, "unavailable activity bars")
     let lowBars = ActivityCalculator.barFractions(for: TransferRates(inbound: 524_288, outbound: 262_144))
-    expect(abs(lowBars.inbound - 0.5) < 0.001, "minimum-scale inbound bar")
-    expect(abs(lowBars.outbound - 0.25) < 0.001, "minimum-scale outbound bar")
+    expect(abs((lowBars?.inbound ?? -1) - 0.5) < 0.001, "minimum-scale inbound bar")
+    expect(abs((lowBars?.outbound ?? -1) - 0.25) < 0.001, "minimum-scale outbound bar")
     let highBars = ActivityCalculator.barFractions(for: TransferRates(inbound: 8_388_608, outbound: 2_097_152))
-    expectEqual(highBars.inbound, 1, "peak inbound bar")
-    expect(abs(highBars.outbound - 0.25) < 0.001, "relative outbound bar")
+    expect(abs((highBars?.inbound ?? -1) - 1) < 0.001, "peak inbound bar")
+    expect(abs((highBars?.outbound ?? -1) - 0.25) < 0.001, "relative outbound bar")
+    checkActivityRetention()
+    checkDeviceChanges()
 
     expectEqual(MetricFormatting.rate(512), "512.0 B/s", "B/s formatting")
     expectEqual(MetricFormatting.rate(1_536), "1.5 KB/s", "KB/s formatting")
@@ -48,7 +55,12 @@ func checkMetricCalculations() {
     let current = [CPUTicks(user: 20, system: 20, idle: 140, nice: 0)]
     let usage = CPUCalculator.usage(previous: previous, current: current)
     expect(abs((usage?.total ?? -1) - 25) < 0.001, "total CPU delta")
-    expect(abs((usage?.cores.first ?? -1) - 25) < 0.001, "per-core CPU delta")
+    expect(abs((usage?.cores[0] ?? -1) - 25) < 0.001, "per-core CPU delta")
+
+    let mixed = CPUCalculator.usage(previous: [tick, previous[0]], current: [tick, current[0]])
+    expectEqual(mixed?.cores[0], nil, "zero-delta core must be unavailable, not idle")
+    expectEqual(mixed?.cores[1], 25, "valid core remains available")
+    expectEqual(mixed?.total, 25, "total uses valid elapsed ticks")
 
     expect(CPUCalculator.usage(previous: [tick], current: [tick]) == nil, "zero CPU delta")
     expect(CPUCalculator.usage(previous: [tick], current: []) == nil, "missing CPU core")
@@ -69,7 +81,107 @@ func checkMetricCalculations() {
     expectEqual(MetricFormatting.percent(23.44), "23.4%", "percentage formatting")
 }
 
+func checkActivityRetention() {
+    var track = ActivityCalculator.Track()
+    struct ReadFailure: Error {}
+    expect(ActivityCalculator.advance(track: &track, now: 1) { throw ReadFailure() } == nil, "failed first read")
+
+    let initial = TransferCounters(inbound: 1_000, outbound: 2_000)
+    expect(ActivityCalculator.advance(track: &track, now: 10) { ["device": initial] } == nil, "first tracked sample")
+    let next = TransferCounters(inbound: 1_124, outbound: 2_512)
+    let rate = ActivityCalculator.advance(track: &track, now: 12) { ["device": next] }
+    expect(abs((rate?.inbound ?? -1) - 62) < 0.001, "tracked inbound rate")
+
+    let kept = ActivityCalculator.advance(track: &track, now: 15) { throw ReadFailure() }
+    expect(abs((kept?.inbound ?? -1) - 62) < 0.001, "failed read keeps last rate")
+    expect(track.previous?.counters == ["device": next], "failed read keeps previous counters")
+
+    expect(ActivityCalculator.advance(track: &track, now: 16) {
+        ["device": TransferCounters(inbound: 1_000, outbound: 2_000)]
+    } == nil, "regressed activity sample")
+    expect(abs((track.lastRate?.inbound ?? -1) - 62) < 0.001, "regression keeps last good rate")
+    let recovered = ActivityCalculator.advance(track: &track, now: 18) {
+        ["device": TransferCounters(inbound: 1_100, outbound: 2_200)]
+    }
+    expect(abs((recovered?.inbound ?? -1) - 50) < 0.001, "rate resumes from new baseline")
+}
+
+func checkDeviceChanges() {
+    var track = ActivityCalculator.Track()
+    let a = TransferCounters(inbound: 100, outbound: 200)
+    let b = TransferCounters(inbound: 9_000_000_000, outbound: 6_000_000_000)
+    expect(ActivityCalculator.advance(track: &track, now: 1) { ["a": a] } == nil, "first device baseline")
+    expectEqual(ActivityCalculator.advance(track: &track, now: 4) { ["a": a, "b": b] }, TransferRates(inbound: 0, outbound: 0), "new device history ignored")
+    expectEqual(ActivityCalculator.advance(track: &track, now: 7) {
+        ["a": TransferCounters(inbound: 400, outbound: 800)]
+    }, TransferRates(inbound: 100, outbound: 200), "removed device does not invalidate remaining device")
+    expectEqual(ActivityCalculator.advance(track: &track, now: 10) {
+        ["a": TransferCounters(inbound: 700, outbound: 1_400), "b": b]
+    }, TransferRates(inbound: 100, outbound: 200), "returning device rebaselines")
+    expectEqual(ActivityCalculator.advance(track: &track, now: 13) {
+        ["a": TransferCounters(inbound: 1_000, outbound: 2_000),
+         "b": TransferCounters(inbound: 9_000_000_600, outbound: 6_000_000_900)]
+    }, TransferRates(inbound: 300, outbound: 500), "stable device rates are summed")
+    expect(ActivityCalculator.advance(track: &track, now: 16) { ["c": b] } == nil, "all replacement devices need a baseline")
+}
+
+func checkNetworkCounters() throws {
+    let active = UInt32(IFF_UP | IFF_RUNNING)
+    let counters = try SystemMetricsSampler.networkCounters(from: [
+        NetworkInterfaceCounters(id: "en0", flags: active, received: 5_000_000_000, sent: 7_000_000_000),
+        NetworkInterfaceCounters(id: "en1", flags: active, received: 1_000, sent: 50),
+        NetworkInterfaceCounters(id: "lo0", flags: active | UInt32(IFF_LOOPBACK), received: 9_000_000_000, sent: 9),
+        NetworkInterfaceCounters(id: "en2", flags: UInt32(IFF_UP), received: 9_000_000_000, sent: 9)
+    ])
+    expectEqual(counters["en0"]?.inbound, 5_000_000_000, "64-bit inbound total")
+    expectEqual(counters["en0"]?.outbound, 7_000_000_000, "64-bit outbound total")
+
+    let before = try SystemMetricsSampler.networkCounters(from: [
+        NetworkInterfaceCounters(id: "en0", flags: active, received: 1_000, sent: 2_000)
+    ])
+    let after = try SystemMetricsSampler.networkCounters(from: [
+        NetworkInterfaceCounters(id: "en0", flags: active, received: 1_000, sent: 2_000),
+        NetworkInterfaceCounters(id: "en1", flags: active, received: 3_000_000_000, sent: 6_000_000_000)
+    ])
+    let unchanged = ActivityCalculator.rates(previous: before, current: after, elapsed: 3)
+    expectEqual(unchanged?.inbound, 0, "joining interface must not contribute historical traffic")
+
+    let empty = try SystemMetricsSampler.networkCounters(from: [])
+    expect(empty.isEmpty, "no active interfaces is a successful empty sample")
+    var reconnectTrack = ActivityCalculator.Track()
+    _ = ActivityCalculator.advance(track: &reconnectTrack, now: 1) { before }
+    _ = ActivityCalculator.advance(track: &reconnectTrack, now: 4) { before }
+    expect(ActivityCalculator.advance(track: &reconnectTrack, now: 7) { empty } == nil, "offline rate unavailable")
+    expect(ActivityCalculator.advance(track: &reconnectTrack, now: 10) { before } == nil, "reconnected interface needs new baseline")
+    expectEqual(ActivityCalculator.advance(track: &reconnectTrack, now: 13) { before }, TransferRates(inbound: 0, outbound: 0), "second reconnected sample is valid")
+    expectEqual(Set(counters.keys), Set(["en0", "en1"]), "inactive and loopback interfaces excluded")
+
+    var track = ActivityCalculator.Track()
+    let baseline: TransferCounterSample = ["en0": TransferCounters(inbound: 100, outbound: 200)]
+    _ = ActivityCalculator.advance(track: &track, now: 1) { baseline }
+    let last = ActivityCalculator.advance(track: &track, now: 3) {
+        ["en0": TransferCounters(inbound: 300, outbound: 600)]
+    }
+    let saved = track.previous
+    var visited: [UInt32] = []
+    let kept = ActivityCalculator.advance(track: &track, now: 5) {
+        try SystemMetricsSampler.networkCounters(indices: [1, 7]) { index in
+            visited.append(index)
+            if index == 7 { throw CheckError.sample }
+            return NetworkInterfaceCounters(id: "en0", flags: active, received: 500, sent: 1_000)
+        }
+    }
+    expectEqual(visited, [1, 7], "sparse interface indices are read")
+    expectEqual(kept, last, "partial read failure keeps last rate")
+    expectEqual(track.previous, saved, "partial read failure preserves full baseline")
+    let recovered = ActivityCalculator.advance(track: &track, now: 7) {
+        ["en0": TransferCounters(inbound: 700, outbound: 1_400)]
+    }
+    expectEqual(recovered, TransferRates(inbound: 100, outbound: 200), "recovery uses elapsed time since last complete sample")
+}
+
 func checkSystemMetricsSampler() async throws {
+    try checkNetworkCounters()
     expectEqual(
         SystemMetricsSampler.usedBytes(active: 10, wired: 20, compressor: 30, pageSize: 4096),
         245_760,
@@ -84,12 +196,14 @@ func checkSystemMetricsSampler() async throws {
 
     let diskCounters = try SystemMetricsSampler.readDiskCounters()
     let networkCounters = try SystemMetricsSampler.readNetworkCounters()
-    expect(diskCounters.inbound > 0 || diskCounters.outbound > 0, "disk counters")
-    expect(networkCounters.inbound > 0 || networkCounters.outbound > 0, "network counters")
+    expect(diskCounters.values.contains { $0.inbound > 0 || $0.outbound > 0 }, "disk counters")
+    expect(networkCounters.values.contains { $0.inbound > 0 || $0.outbound > 0 }, "network counters")
 
     let actor = MetricsSamplingActor(profile: profile)
     let snapshot = try await actor.sample()
     expect(snapshot.cpuUsage == nil, "first live CPU sample")
+    expectEqual(snapshot.coreUsage.count, profile.coreCount, "first CPU sample preserves core placeholders")
+    expect(snapshot.coreUsage.allSatisfy { $0 == nil }, "first core values are unavailable")
     expect(snapshot.diskActivity == nil, "first live disk sample")
     expect(snapshot.networkActivity == nil, "first live network sample")
     expectEqual(snapshot.loadAverages.count, 3, "load average count")
@@ -139,9 +253,9 @@ func checkMetricsStore() async throws {
     let idempotentStore = MetricsStore(providerFactory: { idempotentFake }, sleep: { try await Task.sleep(for: .seconds(60)) })
     idempotentStore.start()
     idempotentStore.start()
-    for _ in 0 ..< 20 {
+    for _ in 0 ..< 50 {
         if await idempotentFake.profileCallCount > 0 { break }
-        await Task.yield()
+        try await Task.sleep(for: .milliseconds(1))
     }
     idempotentStore.stop()
     let profileCalls = await idempotentFake.profileCallCount
@@ -160,12 +274,41 @@ func checkMetricsStore() async throws {
     let recoveryCalls = await recoveryFake.sampleCallCount
     expect(recoveryCalls >= 3, "sampler must recover after a transient failure")
 
+    final class RetryGate: @unchecked Sendable {
+        var allow = false
+    }
+    let gate = RetryGate()
+    let retryFake = MetricsFake(profile: profile, results: [.success(snapshot)])
+    let retryStore = MetricsStore(
+        providerFactory: {
+            guard gate.allow else { throw CheckError.sample }
+            return retryFake
+        },
+        sleep: { try await Task.sleep(for: .seconds(60)) }
+    )
+    retryStore.start()
+    for _ in 0 ..< 100 {
+        if retryStore.errorMessage != nil { break }
+        try await Task.sleep(for: .milliseconds(1))
+    }
+    expect(retryStore.errorMessage != nil, "failed profile read sets an error")
+    try await Task.sleep(for: .milliseconds(1))
+    gate.allow = true
+    retryStore.start()
+    for _ in 0 ..< 100 {
+        if retryStore.snapshot == snapshot { break }
+        try await Task.sleep(for: .milliseconds(1))
+    }
+    retryStore.stop()
+    expectEqual(retryStore.snapshot, snapshot, "refresh loop must restart after it exits")
+    expect(retryStore.errorMessage == nil, "restarted refresh must clear the error")
+
     let stopFake = MetricsFake(profile: profile, results: [.success(snapshot)])
     let stopStore = MetricsStore(providerFactory: { stopFake }, sleep: { try await Task.sleep(for: .seconds(60)) })
     stopStore.start()
     for _ in 0 ..< 100 {
         if await stopFake.sampleCallCount > 0 { break }
-        await Task.yield()
+        try await Task.sleep(for: .milliseconds(1))
     }
     stopStore.stop()
     let stoppedCount = await stopFake.sampleCallCount
@@ -174,20 +317,39 @@ func checkMetricsStore() async throws {
     expectEqual(finalCount, stoppedCount, "stop must prevent additional samples")
 }
 
-checkMetricCalculations()
-print("PASS: metric calculation checks")
+@main
+enum CheckRunner {
+    static func main() async {
+        setvbuf(stdout, nil, _IONBF, 0)
+        setvbuf(stderr, nil, _IONBF, 0)
+        let watchdog = Task.detached {
+            do {
+                try await Task.sleep(for: .seconds(20))
+            } catch {
+                return
+            }
+            fputs("FAIL: checks timed out\n", stderr)
+            fflush(stderr)
+            exit(1)
+        }
+        defer { watchdog.cancel() }
 
-Task {
-    do {
-        try await checkSystemMetricsSampler()
-        print("PASS: system sampler checks")
-        try await checkMetricsStore()
-        print("PASS: metrics store checks")
-        exit(0)
-    } catch {
-        print("FAIL: async checks threw \(error)")
-        exit(1)
+        checkMetricCalculations()
+        pass("metric calculation checks")
+        do {
+            try await checkSystemMetricsSampler()
+            pass("system sampler checks")
+            try await checkMetricsStore()
+            pass("metrics store checks")
+            let lifecycle = StoreLifecycleChecks()
+            await lifecycle.testCancelledSampleFailureCannotOverwriteRestartedSuccess()
+            await lifecycle.testCancelledProfileCannotOverwriteRestartedProfile()
+            await lifecycle.testCancelledSleepFailureCannotOverwriteRestartedSuccess()
+            pass("cancelled task isolation checks")
+        } catch {
+            print("FAIL: async checks threw \(error)")
+            fflush(stdout)
+            exit(1)
+        }
     }
 }
-
-dispatchMain()
