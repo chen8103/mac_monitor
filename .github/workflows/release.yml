@@ -1,0 +1,121 @@
+name: Release macOS app
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vX.Y.Z tag to release
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    env:
+      DEVELOPER_ID_APPLICATION: ${{ secrets.DEVELOPER_ID_APPLICATION }}
+      NOTARY_API_KEY_PATH: ${{ runner.temp }}/AuthKey_${{ secrets.APPSTORE_KEY_ID }}.p8
+      NOTARY_KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+      NOTARY_ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
+
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Determine release tag
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "Tag must use vX.Y.Z format" >&2
+            exit 1
+          }
+          git rev-parse --verify --quiet "$tag^{commit}" >/dev/null
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Import Developer ID certificate
+        shell: bash
+        env:
+          CERTIFICATE_P12_BASE64: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${DEVELOPER_ID_APPLICATION:?Missing DEVELOPER_ID_APPLICATION secret}"
+          : "${CERTIFICATE_P12_BASE64:?Missing DEVELOPER_ID_APPLICATION_P12_BASE64 secret}"
+          : "${CERTIFICATE_PASSWORD:?Missing DEVELOPER_ID_APPLICATION_P12_PASSWORD secret}"
+          certificate_path="$RUNNER_TEMP/developer-id.p12"
+          keychain_path="$RUNNER_TEMP/build.keychain-db"
+          keychain_password="$(openssl rand -base64 32)"
+          printf '%s' "$CERTIFICATE_P12_BASE64" | base64 --decode > "$certificate_path"
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$certificate_path" -k "$keychain_path" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain_path"
+          security list-keychain -d user -s "$keychain_path" login.keychain-db
+          security find-identity -v -p codesigning "$keychain_path" | grep -F "$DEVELOPER_ID_APPLICATION"
+
+      - name: Write App Store Connect API key
+        shell: bash
+        env:
+          APPSTORE_PRIVATE_KEY: ${{ secrets.APPSTORE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          : "${APPSTORE_PRIVATE_KEY:?Missing APPSTORE_PRIVATE_KEY secret}"
+          : "${NOTARY_KEY_ID:?Missing APPSTORE_KEY_ID secret}"
+          : "${NOTARY_ISSUER_ID:?Missing APPSTORE_ISSUER_ID secret}"
+          printf '%s' "$APPSTORE_PRIVATE_KEY" > "$NOTARY_API_KEY_PATH"
+          chmod 600 "$NOTARY_API_KEY_PATH"
+
+      - name: Build, sign, notarize, and verify
+        shell: bash
+        run: Scripts/release.sh "${{ steps.release.outputs.tag }}"
+
+      - name: Publish release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${{ steps.release.outputs.tag }}"
+          artifact_dir="dist/release-${version#v}"
+          notes_file="$RUNNER_TEMP/release-notes.md"
+          cat > "$notes_file" <<EOF
+          Mac Monitor ${version#v} 正式发布包已通过以下检查：
+
+          - Apple Developer ID Application 签名
+          - Apple 公证与 stapled ticket 验证
+          - Gatekeeper 执行评估
+          - Universal 2（arm64 + x86_64）架构验证
+          - ZIP 完整性检查
+
+          请下载 \`MacMonitor-${version#v}.zip\`，并使用同版本的 \`.sha256\` 文件核对下载完整性。
+          EOF
+          if gh release view "$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$version" \
+              "$artifact_dir/MacMonitor-${version#v}.zip" \
+              "$artifact_dir/MacMonitor-${version#v}.zip.sha256" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+            gh release edit "$version" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Mac Monitor ${version#v}" \
+              --notes-file "$notes_file"
+          else
+            gh release create "$version" \
+              "$artifact_dir/MacMonitor-${version#v}.zip" \
+              "$artifact_dir/MacMonitor-${version#v}.zip.sha256" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Mac Monitor ${version#v}" \
+              --notes-file "$notes_file"
+          fi
