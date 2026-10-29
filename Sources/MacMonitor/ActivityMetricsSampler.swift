@@ -4,7 +4,7 @@ import IOKit
 import IOKit.storage
 
 extension SystemMetricsSampler {
-    static func readDiskCounters() throws -> TransferCounters {
+    static func readDiskCounters() throws -> TransferCounterSample {
         var iterator = io_iterator_t()
         let result = IOServiceGetMatchingServices(
             kIOMainPortDefault,
@@ -16,72 +16,96 @@ extension SystemMetricsSampler {
         }
         defer { IOObjectRelease(iterator) }
 
-        var bytesRead: UInt64 = 0
-        var bytesWritten: UInt64 = 0
-        var deviceCount = 0
-
+        var counters: TransferCounterSample = [:]
         while case let service = IOIteratorNext(iterator), service != 0 {
             defer { IOObjectRelease(service) }
+            var id: UInt64 = 0
+            let idResult = IORegistryEntryGetRegistryEntryID(service, &id)
+            guard idResult == KERN_SUCCESS else {
+                throw SamplingError.systemCall("IORegistryEntryGetRegistryEntryID", idResult)
+            }
             var properties: Unmanaged<CFMutableDictionary>?
-            guard IORegistryEntryCreateCFProperties(
-                service,
-                &properties,
-                kCFAllocatorDefault,
-                0
-            ) == KERN_SUCCESS,
-                let properties,
-                let dictionary = properties.takeRetainedValue() as? [String: Any],
-                let statistics = dictionary[kIOBlockStorageDriverStatisticsKey] as? [String: Any] else {
-                continue
+            let propertyResult = IORegistryEntryCreateCFProperties(service, &properties, kCFAllocatorDefault, 0)
+            guard propertyResult == KERN_SUCCESS else {
+                throw SamplingError.systemCall("IORegistryEntryCreateCFProperties", propertyResult)
             }
-
-            if let read = statistics[kIOBlockStorageDriverStatisticsBytesReadKey] as? NSNumber,
-               let written = statistics[kIOBlockStorageDriverStatisticsBytesWrittenKey] as? NSNumber {
-                bytesRead += read.uint64Value
-                bytesWritten += written.uint64Value
-                deviceCount += 1
+            guard let properties,
+                  let dictionary = properties.takeRetainedValue() as? [String: Any],
+                  let statistics = dictionary[kIOBlockStorageDriverStatisticsKey] as? [String: Any],
+                  let read = statistics[kIOBlockStorageDriverStatisticsBytesReadKey] as? NSNumber,
+                  let written = statistics[kIOBlockStorageDriverStatisticsBytesWrittenKey] as? NSNumber else {
+                throw SamplingError.invalidValue("disk counters")
             }
+            counters[String(id)] = TransferCounters(inbound: read.uint64Value, outbound: written.uint64Value)
         }
-
-        guard deviceCount > 0 else {
-            throw SamplingError.invalidValue("disk counters")
+        guard IOIteratorIsValid(iterator) != 0 else {
+            throw SamplingError.invalidValue("disk devices")
         }
-        return TransferCounters(inbound: bytesRead, outbound: bytesWritten)
+        return counters
     }
 
-    static func readNetworkCounters() throws -> TransferCounters {
-        var addresses: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&addresses) == 0, let addresses else {
-            throw SamplingError.systemCall("getifaddrs", errno)
+    static func readNetworkCounters() throws -> TransferCounterSample {
+        guard let interfaces = if_nameindex() else {
+            throw SamplingError.systemCall("if_nameindex", errno)
         }
-        defer { freeifaddrs(addresses) }
-
-        var downloaded: UInt64 = 0
-        var uploaded: UInt64 = 0
-        var interfaceCount = 0
-        var cursor: UnsafeMutablePointer<ifaddrs>? = addresses
-
-        while let interface = cursor {
-            let flags = Int32(interface.pointee.ifa_flags)
-            let isActive = flags & IFF_UP != 0 && flags & IFF_RUNNING != 0
-            let isLoopback = flags & IFF_LOOPBACK != 0
-
-            if isActive,
-               !isLoopback,
-               let address = interface.pointee.ifa_addr,
-               address.pointee.sa_family == UInt8(AF_LINK),
-               let rawData = interface.pointee.ifa_data {
-                let data = rawData.assumingMemoryBound(to: if_data.self).pointee
-                downloaded += UInt64(data.ifi_ibytes)
-                uploaded += UInt64(data.ifi_obytes)
-                interfaceCount += 1
-            }
-            cursor = interface.pointee.ifa_next
+        defer { if_freenameindex(interfaces) }
+        var indices: [UInt32] = []
+        var cursor = interfaces
+        while cursor.pointee.if_index != 0 {
+            indices.append(cursor.pointee.if_index)
+            cursor = cursor.advanced(by: 1)
         }
-
-        guard interfaceCount > 0 else {
-            throw SamplingError.invalidValue("network interfaces")
-        }
-        return TransferCounters(inbound: downloaded, outbound: uploaded)
+        return try networkCounters(indices: indices, read: readNetworkInterface)
     }
+
+    static func networkCounters(
+        indices: [UInt32],
+        read: (UInt32) throws -> NetworkInterfaceCounters
+    ) throws -> TransferCounterSample {
+        try networkCounters(from: indices.map { try read($0) })
+    }
+
+    private static func readNetworkInterface(index: UInt32) throws -> NetworkInterfaceCounters {
+        // The routing-socket counters cap byte totals at 32 bits. IFMIB matches netstat's 64-bit totals.
+        var mib: [Int32] = [CTL_NET, PF_LINK, NETLINK_GENERIC, IFMIB_IFDATA, Int32(index), IFDATA_GENERAL]
+        var data = ifmibdata()
+        var length = MemoryLayout<ifmibdata>.size
+        let result = withUnsafeMutablePointer(to: &data) { pointer in
+            sysctl(&mib, u_int(mib.count), pointer, &length, nil, 0)
+        }
+        guard result == 0 else {
+            throw SamplingError.systemCall("IFMIB_IFDATA", errno)
+        }
+        guard length == MemoryLayout<ifmibdata>.size else {
+            throw SamplingError.invalidValue("network counters")
+        }
+        let name = withUnsafeBytes(of: data.ifmd_name) { bytes in
+            String(decoding: bytes.prefix { $0 != 0 }, as: UTF8.self)
+        }
+        return NetworkInterfaceCounters(
+            id: "\(index):\(name)",
+            flags: data.ifmd_flags,
+            received: data.ifmd_data.ifi_ibytes,
+            sent: data.ifmd_data.ifi_obytes
+        )
+    }
+
+    static func networkCounters(from interfaces: [NetworkInterfaceCounters]) throws -> TransferCounterSample {
+        var counters: TransferCounterSample = [:]
+        for interface in interfaces {
+            let isActive = interface.flags & UInt32(IFF_UP) != 0 && interface.flags & UInt32(IFF_RUNNING) != 0
+            let isLoopback = interface.flags & UInt32(IFF_LOOPBACK) != 0
+            if isActive, !isLoopback {
+                counters[interface.id] = TransferCounters(inbound: interface.received, outbound: interface.sent)
+            }
+        }
+        return counters
+    }
+}
+
+struct NetworkInterfaceCounters: Equatable, Sendable {
+    var id: String
+    var flags: UInt32
+    var received: UInt64
+    var sent: UInt64
 }

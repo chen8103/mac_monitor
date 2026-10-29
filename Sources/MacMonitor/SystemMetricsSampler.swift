@@ -27,51 +27,58 @@ enum SystemMetricsSampler {
     }
 
     static func readCPUTicks() throws -> [CPUTicks] {
-        var flavorCount = mach_msg_type_number_t(CPU_STATE_MAX)
-        var info: processor_info_array_t?
-        var infoCount = mach_msg_type_number_t()
-        let result = host_processor_info(
-            mach_host_self(),
-            PROCESSOR_CPU_LOAD_INFO,
-            &flavorCount,
-            &info,
-            &infoCount
-        )
-
-        guard result == KERN_SUCCESS, let info else {
-            throw SamplingError.systemCall("host_processor_info", result)
-        }
-        defer {
-            let byteCount = vm_size_t(Int(infoCount) * MemoryLayout<integer_t>.size)
-            vm_deallocate(mach_task_self_, vm_address_t(UInt(bitPattern: info)), byteCount)
-        }
-
-        let ticksPerCore = Int(CPU_STATE_MAX)
-        guard infoCount > 0, Int(infoCount).isMultiple(of: ticksPerCore) else {
-            throw SamplingError.invalidValue("CPU ticks")
-        }
-
-        return (0 ..< Int(infoCount) / ticksPerCore).map { core in
-            let offset = core * ticksPerCore
-            return CPUTicks(
-                user: UInt64(UInt32(bitPattern: info[offset + Int(CPU_STATE_USER)])),
-                system: UInt64(UInt32(bitPattern: info[offset + Int(CPU_STATE_SYSTEM)])),
-                idle: UInt64(UInt32(bitPattern: info[offset + Int(CPU_STATE_IDLE)])),
-                nice: UInt64(UInt32(bitPattern: info[offset + Int(CPU_STATE_NICE)]))
+        try withHostPort { host in
+            var processorCount = mach_msg_type_number_t()
+            var info: processor_info_array_t?
+            var infoCount = mach_msg_type_number_t()
+            let result = host_processor_info(
+                host,
+                PROCESSOR_CPU_LOAD_INFO,
+                &processorCount,
+                &info,
+                &infoCount
             )
+            defer {
+                if let info {
+                    let byteCount = vm_size_t(Int(infoCount) * MemoryLayout<integer_t>.size)
+                    vm_deallocate(mach_task_self_, vm_address_t(UInt(bitPattern: info)), byteCount)
+                }
+            }
+
+            guard result == KERN_SUCCESS, let info else {
+                throw SamplingError.systemCall("host_processor_info", result)
+            }
+
+            let ticksPerCore = Int(CPU_STATE_MAX)
+            guard processorCount > 0, Int(infoCount) == Int(processorCount) * ticksPerCore else {
+                throw SamplingError.invalidValue("CPU ticks")
+            }
+
+            return (0 ..< Int(processorCount)).map { core in
+                let offset = core * ticksPerCore
+                return CPUTicks(
+                    user: UInt64(UInt32(bitPattern: info[offset + Int(CPU_STATE_USER)])),
+                    system: UInt64(UInt32(bitPattern: info[offset + Int(CPU_STATE_SYSTEM)])),
+                    idle: UInt64(UInt32(bitPattern: info[offset + Int(CPU_STATE_IDLE)])),
+                    nice: UInt64(UInt32(bitPattern: info[offset + Int(CPU_STATE_NICE)]))
+                )
+            }
         }
     }
 
     static func readUsedMemory() throws -> UInt64 {
-        var statistics = vm_statistics64()
-        var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64>.size / MemoryLayout<integer_t>.size)
-        let result = withUnsafeMutablePointer(to: &statistics) { pointer in
-            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { rebound in
-                host_statistics64(mach_host_self(), HOST_VM_INFO64, rebound, &count)
+        let statistics = try withHostPort { host in
+            var statistics = vm_statistics64()
+            var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64>.size / MemoryLayout<integer_t>.size)
+            let result = withUnsafeMutablePointer(to: &statistics) { pointer in
+                pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { rebound in
+                    host_statistics64(host, HOST_VM_INFO64, rebound, &count)
+                }
             }
-        }
-        guard result == KERN_SUCCESS else {
-            throw SamplingError.systemCall("host_statistics64", result)
+            guard result == KERN_SUCCESS else {
+                throw SamplingError.systemCall("host_statistics64", result)
+            }
+            return statistics
         }
 
         let pageSize = try readSysctlValue("hw.pagesize", defaultValue: UInt64(0))
@@ -116,6 +123,12 @@ enum SystemMetricsSampler {
             throw SamplingError.systemCall(name, errno)
         }
         return value
+    }
+
+    private static func withHostPort<T>(_ body: (host_t) throws -> T) throws -> T {
+        let host = mach_host_self()
+        defer { mach_port_deallocate(mach_task_self_, host) }
+        return try body(host)
     }
 
     private static func readSysctlString(_ name: String) throws -> String {

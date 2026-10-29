@@ -20,6 +20,8 @@ struct TransferCounters: Equatable, Sendable {
     let outbound: UInt64
 }
 
+typealias TransferCounterSample = [String: TransferCounters]
+
 struct TransferRates: Equatable, Sendable {
     let inbound: Double
     let outbound: Double
@@ -28,7 +30,7 @@ struct TransferRates: Equatable, Sendable {
 struct MetricsSnapshot: Equatable, Sendable {
     let uptime: TimeInterval
     let cpuUsage: Double?
-    let coreUsage: [Double]
+    let coreUsage: [Double?]
     let loadAverages: [Double]
     let usedMemory: UInt64
     let totalMemory: UInt64
@@ -38,7 +40,7 @@ struct MetricsSnapshot: Equatable, Sendable {
     init(
         uptime: TimeInterval,
         cpuUsage: Double?,
-        coreUsage: [Double],
+        coreUsage: [Double?],
         loadAverages: [Double],
         usedMemory: UInt64,
         totalMemory: UInt64,

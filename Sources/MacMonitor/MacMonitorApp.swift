@@ -42,7 +42,6 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSPopoverDelegat
             popover.performClose(nil)
         } else {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-            startClickMonitors()
         }
     }
 
@@ -89,8 +88,14 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSPopoverDelegat
         }
     }
 
+    func popoverWillShow(_ notification: Notification) {
+        store.start()
+        startClickMonitors()
+    }
+
     func popoverDidClose(_ notification: Notification) {
         stopClickMonitors()
+        store.stop()
     }
 }
 

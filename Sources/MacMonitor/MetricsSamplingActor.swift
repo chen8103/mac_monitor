@@ -8,8 +8,8 @@ protocol MetricsSampling: Sendable {
 actor MetricsSamplingActor: MetricsSampling {
     let systemProfile: SystemProfile
     private var previousTicks: [CPUTicks]?
-    private var previousDisk: (counters: TransferCounters, time: TimeInterval)?
-    private var previousNetwork: (counters: TransferCounters, time: TimeInterval)?
+    private var diskTrack = ActivityCalculator.Track()
+    private var networkTrack = ActivityCalculator.Track()
 
     init(profile: SystemProfile) {
         systemProfile = profile
@@ -25,30 +25,17 @@ actor MetricsSamplingActor: MetricsSampling {
         previousTicks = currentTicks
 
         let now = ProcessInfo.processInfo.systemUptime
-        var diskActivity: TransferRates?
-        if let counters = try? SystemMetricsSampler.readDiskCounters() {
-            diskActivity = ActivityCalculator.rates(
-                previous: previousDisk?.counters,
-                current: counters,
-                elapsed: now - (previousDisk?.time ?? now)
-            )
-            previousDisk = (counters, now)
+        let diskActivity = ActivityCalculator.advance(track: &diskTrack, now: now) {
+            try SystemMetricsSampler.readDiskCounters()
         }
-
-        var networkActivity: TransferRates?
-        if let counters = try? SystemMetricsSampler.readNetworkCounters() {
-            networkActivity = ActivityCalculator.rates(
-                previous: previousNetwork?.counters,
-                current: counters,
-                elapsed: now - (previousNetwork?.time ?? now)
-            )
-            previousNetwork = (counters, now)
+        let networkActivity = ActivityCalculator.advance(track: &networkTrack, now: now) {
+            try SystemMetricsSampler.readNetworkCounters()
         }
 
         return MetricsSnapshot(
             uptime: now,
             cpuUsage: cpu?.total,
-            coreUsage: cpu?.cores ?? [],
+            coreUsage: cpu?.cores ?? Array(repeating: nil, count: currentTicks.count),
             loadAverages: try SystemMetricsSampler.readLoadAverages(),
             usedMemory: try SystemMetricsSampler.readUsedMemory(),
             totalMemory: systemProfile.totalMemory,

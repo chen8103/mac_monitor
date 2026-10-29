@@ -40,27 +40,36 @@ extension LoadLevel {
 }
 
 struct MetricBar: View {
-    let value: Double
+    let value: Double?
     let color: Color
     var height: CGFloat = 10
 
     var body: some View {
         GeometryReader { geometry in
             ZStack(alignment: .leading) {
-                Capsule()
-                    .fill(Color.barTrack)
-                Capsule()
-                    .fill(color)
-                    .frame(width: geometry.size.width * min(max(value, 0), 1))
+                if let value {
+                    Capsule()
+                        .fill(Color.barTrack)
+                    Capsule()
+                        .fill(color)
+                        .frame(width: geometry.size.width * min(max(value, 0), 1))
+                } else {
+                    Capsule()
+                        .strokeBorder(
+                            Color.secondaryText.opacity(0.45),
+                            style: StrokeStyle(lineWidth: 1, dash: [2, 2])
+                        )
+                }
             }
+            .frame(width: geometry.size.width, height: geometry.size.height)
         }
         .frame(height: height)
-        .accessibilityValue("\(Int(min(max(value, 0), 1) * 100))%")
+        .accessibilityValue(value.map { "\(Int(min(max($0, 0), 1) * 100))%" } ?? "—")
     }
 }
 
 struct CoreUsageGrid: View {
-    let values: [Double]
+    let values: [Double?]
     private let columns = [GridItem(.adaptive(minimum: 68), spacing: 8)]
 
     var body: some View {
@@ -70,11 +79,15 @@ struct CoreUsageGrid: View {
                     HStack {
                         Text("C\(index)")
                         Spacer()
-                        Text(MetricFormatting.percent(value))
+                        Text(value.map(MetricFormatting.percent) ?? "—")
                     }
                     .font(.system(size: 9, design: .monospaced))
                     .foregroundStyle(Color.secondaryText)
-                    MetricBar(value: value / 100, color: LoadLevel.cpu(value).cpuColor, height: 6)
+                    MetricBar(
+                        value: value.map { $0 / 100 },
+                        color: value.map { LoadLevel.cpu($0).cpuColor } ?? .cpuBlue,
+                        height: 6
+                    )
                 }
             }
         }

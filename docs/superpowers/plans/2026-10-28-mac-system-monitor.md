@@ -1,5 +1,7 @@
 # Mac System Monitor Implementation Plan
 
+> **Current product:** The shipped app is a menu bar popover. [README](../../../README.md) is the contract. This plan describes the original window design and is kept as implementation history.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build a dependency-free native macOS app that shows real CPU, per-core, memory, load, uptime, and system information in a bright, light-colored desktop panel.

@@ -1,14 +1,14 @@
 import Foundation
 
 enum CPUCalculator {
-    static func usage(previous: [CPUTicks]?, current: [CPUTicks]) -> (total: Double, cores: [Double])? {
+    static func usage(previous: [CPUTicks]?, current: [CPUTicks]) -> (total: Double, cores: [Double?])? {
         guard let previous, !previous.isEmpty, previous.count == current.count else {
             return nil
         }
 
         var totalBusy = 0.0
         var totalElapsed = 0.0
-        var cores: [Double] = []
+        var cores: [Double?] = []
         cores.reserveCapacity(current.count)
 
         for (old, new) in zip(previous, current) {
@@ -23,7 +23,7 @@ enum CPUCalculator {
             let elapsed = busy + Double(new.idle - old.idle)
             totalBusy += busy
             totalElapsed += elapsed
-            cores.append(elapsed > 0 ? clamp(100 * busy / elapsed) : 0)
+            cores.append(elapsed > 0 ? clamp(100 * busy / elapsed) : nil)
         }
 
         guard totalElapsed > 0 else { return nil }
@@ -36,6 +36,16 @@ enum CPUCalculator {
 }
 
 enum ActivityCalculator {
+    struct Sample: Equatable, Sendable {
+        var counters: TransferCounterSample
+        var time: TimeInterval
+    }
+
+    struct Track: Equatable, Sendable {
+        var previous: Sample?
+        var lastRate: TransferRates?
+    }
+
     static func rates(
         previous: TransferCounters?,
         current: TransferCounters,
@@ -54,11 +64,57 @@ enum ActivityCalculator {
         )
     }
 
+    static func rates(
+        previous: TransferCounterSample?,
+        current: TransferCounterSample,
+        elapsed: TimeInterval
+    ) -> TransferRates? {
+        guard let previous, elapsed.isFinite, elapsed > 0 else { return nil }
+        var inbound = 0.0
+        var outbound = 0.0
+        var matched = false
+        for (id, counters) in current {
+            guard let rate = rates(previous: previous[id], current: counters, elapsed: elapsed) else {
+                continue
+            }
+            inbound += rate.inbound
+            outbound += rate.outbound
+            matched = true
+        }
+        return matched ? TransferRates(inbound: inbound, outbound: outbound) : nil
+    }
+
+    /// A failed counter read keeps the last rate. An invalid delta stays unavailable
+    /// and still moves the baseline forward.
+    static func advance(
+        track: inout Track,
+        now: TimeInterval,
+        read: () throws -> TransferCounterSample
+    ) -> TransferRates? {
+        let counters: TransferCounterSample
+        do {
+            counters = try read()
+        } catch {
+            return track.lastRate
+        }
+
+        let rate = rates(
+            previous: track.previous?.counters,
+            current: counters,
+            elapsed: now - (track.previous?.time ?? now)
+        )
+        track.previous = Sample(counters: counters, time: now)
+        if let rate {
+            track.lastRate = rate
+        }
+        return rate
+    }
+
     static func barFractions(
         for rates: TransferRates?,
         minimumScale: Double = 1_048_576
-    ) -> (inbound: Double, outbound: Double) {
-        guard let rates else { return (0, 0) }
+    ) -> (inbound: Double, outbound: Double)? {
+        guard let rates else { return nil }
         let scale = max(minimumScale, rates.inbound, rates.outbound)
         return (
             min(max(rates.inbound / scale, 0), 1),

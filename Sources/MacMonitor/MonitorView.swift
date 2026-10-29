@@ -34,12 +34,6 @@ struct MonitorView: View {
         }
         .frame(width: 420, height: 500)
         .background(Color.panelBackground)
-        .task {
-            store.start()
-        }
-        .onDisappear {
-            store.stop()
-        }
     }
 
     private var header: some View {
@@ -71,7 +65,10 @@ struct MonitorView: View {
             }
 
             let usage = store.snapshot?.cpuUsage
-            MetricBar(value: (usage ?? 0) / 100, color: usage.map { LoadLevel.cpu($0).cpuColor } ?? .cpuBlue)
+            MetricBar(
+                value: usage.map { $0 / 100 },
+                color: usage.map { LoadLevel.cpu($0).cpuColor } ?? .cpuBlue
+            )
 
             Text(cpuDetails)
                 .font(.system(size: 12, design: .monospaced))
@@ -104,21 +101,27 @@ struct MonitorView: View {
             }
 
             let fraction = memoryFraction
-            MetricBar(value: fraction, color: LoadLevel.memory(fraction * 100).memoryColor)
+            MetricBar(
+                value: fraction,
+                color: fraction.map { LoadLevel.memory($0 * 100).memoryColor } ?? .memoryTeal
+            )
         }
     }
 
     private var memoryText: String {
         let total = store.snapshot?.totalMemory ?? store.profile?.totalMemory
-        let totalText = total.map(MetricFormatting.gibibytes) ?? "—"
+        guard let total, total > 0 else {
+            return "— / — GiB"
+        }
+        let totalText = MetricFormatting.gibibytes(total)
         guard let snapshot = store.snapshot else {
             return "— / \(totalText) GiB"
         }
         return "\(MetricFormatting.gibibytes(snapshot.usedMemory)) / \(totalText) GiB"
     }
 
-    private var memoryFraction: Double {
-        guard let snapshot = store.snapshot, snapshot.totalMemory > 0 else { return 0 }
+    private var memoryFraction: Double? {
+        guard let snapshot = store.snapshot, snapshot.totalMemory > 0 else { return nil }
         return min(max(Double(snapshot.usedMemory) / Double(snapshot.totalMemory), 0), 1)
     }
 
@@ -149,8 +152,8 @@ struct MonitorView: View {
                 }
             }
             HStack(spacing: 8) {
-                MetricBar(value: fractions.inbound, color: inboundColor, height: 6)
-                MetricBar(value: fractions.outbound, color: outboundColor, height: 6)
+                MetricBar(value: fractions?.inbound, color: inboundColor, height: 6)
+                MetricBar(value: fractions?.outbound, color: outboundColor, height: 6)
             }
         }
     }
